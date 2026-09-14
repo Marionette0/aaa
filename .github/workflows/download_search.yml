@@ -1,0 +1,399 @@
+name: 关键词搜索下载本子
+
+# 流程说明：
+# 1. 搜索 job：搜索关键词，预先给每个结果分配好压缩包名，产出分批计划（albums.json / batches.json）
+# 2. 下载 job（matrix，默认每个本子一个job）：只下载本批的本子，**每下完一个立即打包**成 <本子名>.zip，
+#    所以这个 job 一跑完，它产出的 zip 就立刻出现在页面的 Artifacts 区，不用等全部下完
+# 3. 汇总 job：把所有本子的状态合并成最终 md（中途失败也会执行，能拿到已完成部分）
+
+on:
+  workflow_dispatch:
+    inputs:
+      SEARCH_KEYWORD:
+        type: string
+        description: '搜索关键词（必填）。如：+全彩 +人妻（同时包含）；全彩 -人妻（排除）。也可以直接填本子id'
+        required: true
+
+      SEARCH_TYPE:
+        type: choice
+        description: '搜索范围'
+        default: 'site | 站内搜索'
+        required: false
+        options:
+          - 'site | 站内搜索'
+          - 'work | 作品'
+          - 'author | 作者'
+          - 'tag | 标签'
+          - 'actor | 角色'
+
+      SEARCH_PAGE:
+        type: number
+        description: '搜索结果的起始页码'
+        default: 1
+        required: false
+
+      SEARCH_PAGE_SIZE:
+        type: number
+        description: '要下载的搜索结果数量（最多）。只导出md模式请用 META_MAX'
+        default: 10
+        required: false
+
+      SEARCH_ORDER_BY:
+        type: choice
+        description: '排序方式'
+        default: 'mr | 最新'
+        required: false
+        options:
+          - 'mr | 最新'
+          - 'mv | 最多观看'
+          - 'mp | 最多图片'
+          - 'tf | 最多点赞'
+          - 'tr | 评分'
+          - 'md | 评论数'
+
+      SEARCH_TIME:
+        type: choice
+        description: '时间范围'
+        default: 'a | 全部时间'
+        required: false
+        options:
+          - 'a | 全部时间'
+          - 't | 今日'
+          - 'w | 本周'
+          - 'm | 本月'
+
+      SEARCH_CATEGORY:
+        type: choice
+        description: '本子类别'
+        default: '0 | 全部'
+        required: false
+        options:
+          - '0 | 全部'
+          - 'doujin | 同人'
+          - 'single | 单本'
+          - 'short | 短篇'
+          - 'another | 其他'
+          - 'hanman | 韩漫'
+          - 'meiman | 美漫'
+          - 'doujin_cosplay | Cosplay'
+          - '3D | 3D'
+          - 'english_site | 英文站'
+
+      SEARCH_SUB_CATEGORY:
+        type: string
+        description: '副分类（可选，进阶）。网页端支持，取值见 docs/option_file_syntax.md'
+        default: ''
+        required: false
+
+      BATCH_SIZE:
+        type: number
+        description: '每个下载job处理几个本子。1 = 每个本子一个job，zip最快陆续出现在产物区；调大则job数和耗时更少'
+        default: 1
+        required: false
+
+      MAX_PARALLEL:
+        type: number
+        description: '同时运行的下载job数量上限（免费账号并发上限是20，别填太大）'
+        default: 10
+        required: false
+
+      META_ONLY:
+        type: choice
+        description: '是否只导出md（不下载图片、不打包zip、不起下载job）。选"是"时会翻页收录搜索结果（受 META_MAX 限制）'
+        default: '否'
+        required: false
+        options:
+          - 否
+          - 是
+
+      META_MAX:
+        type: number
+        description: '只导出md模式下，最多收录的搜索结果数量（翻页搜索直到达到该数量或没有更多结果）。0 表示不限制'
+        default: 100
+        required: false
+
+      DELETE_AFTER_ZIP:
+        type: choice
+        description: '每个本子打包成zip后，是否删除原始图片文件夹（zip内保留章节结构，原始文件就不再保留）'
+        default: 是
+        required: false
+        options:
+          - 是
+          - 否
+
+      CLIENT_IMPL:
+        type: string
+        description: '客户端类型（client.impl），下载失败时，你可以尝试填入此项重试。api 表示移动端，html 表示网页端。'
+        default: ''
+        required: false
+
+      IMAGE_SUFFIX:
+        type: string
+        description: '图片后缀（download.cache.suffix），默认为空，表示不做图片格式转换。可填入例如 png、jpg'
+        default: ''
+        required: false
+
+      IMAGE_QUALITY:
+        type: number
+        description: '图片质量（1-99开启压缩；100不压缩。此配置不支持后缀=PNG的图片。pdf模式会把图片转为JPEG压缩再合并pdf）'
+        default: 100
+        required: false
+
+      DIR_RULE:
+        type: string
+        description: '下载文件夹规则（dir_rule.rule）。默认使用配置文件的 Bd_Aauthor_Atitle_Pindex。'
+        default: ''
+        required: false
+
+      PDF_OPTION:
+        description: '是否要下载后将图片合并为pdf文件'
+        required: false
+        type: choice
+        options:
+          - 否
+          - 是 | 本子维度合并pdf
+          - 是 | 章节维度合并pdf
+
+      PDF_NAME_RULE:
+        type: string
+        description: 'PDF文件命名规则。支持字段如 Aid, Atitle, Pindex, Pid, Ptitle'
+        default: ''
+        required: false
+
+# 所有 job 共用的环境变量
+env:
+  # 搜索相关输入
+  SEARCH_KEYWORD: ${{ github.event.inputs.SEARCH_KEYWORD }}
+  SEARCH_TYPE: ${{ github.event.inputs.SEARCH_TYPE }}
+  SEARCH_PAGE: ${{ github.event.inputs.SEARCH_PAGE }}
+  SEARCH_PAGE_SIZE: ${{ github.event.inputs.SEARCH_PAGE_SIZE }}
+  SEARCH_ORDER_BY: ${{ github.event.inputs.SEARCH_ORDER_BY }}
+  SEARCH_TIME: ${{ github.event.inputs.SEARCH_TIME }}
+  SEARCH_CATEGORY: ${{ github.event.inputs.SEARCH_CATEGORY }}
+  SEARCH_SUB_CATEGORY: ${{ github.event.inputs.SEARCH_SUB_CATEGORY }}
+
+  # 分批与模式
+  BATCH_SIZE: ${{ github.event.inputs.BATCH_SIZE }}
+  META_ONLY: ${{ github.event.inputs.META_ONLY }}
+  META_MAX: ${{ github.event.inputs.META_MAX }}
+  DELETE_AFTER_ZIP: ${{ github.event.inputs.DELETE_AFTER_ZIP }}
+
+  # 下载相关输入
+  CLIENT_IMPL: ${{ github.event.inputs.CLIENT_IMPL }}
+  DIR_RULE: ${{ github.event.inputs.DIR_RULE }}
+  IMAGE_SUFFIX: ${{ github.event.inputs.IMAGE_SUFFIX }}
+  IMAGE_QUALITY: ${{ github.event.inputs.IMAGE_QUALITY }}
+  PDF_OPTION: ${{ github.event.inputs.PDF_OPTION }}
+  PDF_NAME_RULE: ${{ github.event.inputs.PDF_NAME_RULE }}
+
+  # 登录相关secrets
+  JM_USERNAME: ${{ secrets.JM_USERNAME }}
+  JM_PASSWORD: ${{ secrets.JM_PASSWORD }}
+
+  # 邮件相关secrets
+  EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+  EMAIL_TO: ${{ secrets.EMAIL_TO }}
+  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+  EMAIL_TITLE: ${{ secrets.EMAIL_TITLE }}
+  EMAIL_CONTENT: ${{ secrets.EMAIL_CONTENT }}
+
+  # 固定值
+  JM_DOWNLOAD_DIR: /home/runner/work/jmcomic/download/
+  JM_META_DIR: /home/runner/work/jmcomic/meta/
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. 搜索：出本子清单 + 分批计划
+  # ------------------------------------------------------------------
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      batches: ${{ steps.plan.outputs.batches }}
+      album_count: ${{ steps.plan.outputs.album_count }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/requirements-dev.txt
+
+      - name: Install Dependency
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r .github/requirements-dev.txt
+
+      - name: Install img2pdf
+        if: inputs.PDF_OPTION != '否'
+        run: pip install img2pdf
+
+      - name: 安装jmcomic（pip）
+        if: ${{ github.ref != 'refs/heads/dev' }}
+        run: pip install jmcomic -i https://pypi.org/project --upgrade
+
+      - name: 安装jmcomic（local）
+        if: ${{ github.ref == 'refs/heads/dev' }}
+        run: pip install -e ./
+
+      - name: 搜索并生成分批计划
+        env:
+          SCRIPT_MODE: search
+        run: |
+          cd ./usage/
+          python workflow_search.py
+
+      - name: 读取分批计划
+        id: plan
+        run: |
+          echo "batches=$(tr -d '\n' < $JM_META_DIR/batches.json)" >> "$GITHUB_OUTPUT"
+          album_count=$(python -c "import json,sys;print(len(json.load(open(sys.argv[1]))['albums']))" "$JM_META_DIR/albums.json")
+          echo "album_count=$album_count" >> "$GITHUB_OUTPUT"
+          echo "本子数量: $album_count"
+
+      - name: 上传搜索元信息（清单 + 分批计划）
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 搜索元信息
+          path: ${{ env.JM_META_DIR }}/*
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: 上传搜索结果md
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          # 只导出md模式下这就是最终md；下载模式下这是下载前的预览版，最终版由汇总job生成
+          name: ${{ inputs.META_ONLY == '是' && '搜索结果md' || '搜索结果md-预览' }}
+          path: ${{ env.JM_DOWNLOAD_DIR }}/*.md
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ------------------------------------------------------------------
+  # 2. 分批下载并打包：一个 job 一批（默认一批一个本子），跑完即出产物
+  # ------------------------------------------------------------------
+  download:
+    needs: search
+    if: ${{ inputs.META_ONLY != '是' && needs.search.outputs.album_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SCRIPT_MODE: download
+      ALBUM_IDS: ${{ matrix.batch.ids }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.MAX_PARALLEL) }}
+      matrix:
+        batch: ${{ fromJSON(needs.search.outputs.batches) }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/requirements-dev.txt
+
+      - name: Install Dependency
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r .github/requirements-dev.txt
+
+      - name: Install img2pdf
+        if: inputs.PDF_OPTION != '否'
+        run: pip install img2pdf
+
+      - name: 安装jmcomic（pip）
+        if: ${{ github.ref != 'refs/heads/dev' }}
+        run: pip install jmcomic -i https://pypi.org/project --upgrade
+
+      - name: 安装jmcomic（local）
+        if: ${{ github.ref == 'refs/heads/dev' }}
+        run: pip install -e ./
+
+      - name: 下载搜索元信息
+        uses: actions/download-artifact@v4
+        with:
+          name: 搜索元信息
+          path: ${{ env.JM_META_DIR }}
+
+      - name: 下载本批本子并立即打包 ${{ matrix.batch.ids }}
+        run: |
+          cd ./usage/
+          python workflow_search.py
+
+      - name: 上传本批产物（zip + 状态）
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 本子-${{ matrix.batch.ids }}
+          path: |
+            ${{ env.JM_DOWNLOAD_DIR }}/*.zip
+            ${{ env.JM_DOWNLOAD_DIR }}/status/*.json
+            ${{ env.JM_DOWNLOAD_DIR }}/*.log
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ------------------------------------------------------------------
+  # 3. 汇总：把各本子的状态合并成最终 md（有失败的批次也会执行）
+  # ------------------------------------------------------------------
+  finalize:
+    needs: [ search, download ]
+    if: ${{ !cancelled() && inputs.META_ONLY != '是' && needs.search.result == 'success' && needs.search.outputs.album_count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCRIPT_MODE: merge
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/requirements-dev.txt
+
+      - name: Install Dependency
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r .github/requirements-dev.txt
+
+      - name: 安装jmcomic（pip）
+        if: ${{ github.ref != 'refs/heads/dev' }}
+        run: pip install jmcomic -i https://pypi.org/project --upgrade
+
+      - name: 安装jmcomic（local）
+        if: ${{ github.ref == 'refs/heads/dev' }}
+        run: pip install -e ./
+
+      - name: 下载搜索元信息
+        uses: actions/download-artifact@v4
+        with:
+          name: 搜索元信息
+          path: ${{ env.JM_META_DIR }}
+
+      - name: 下载所有本子的状态文件
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 本子-*
+          path: ${{ env.JM_DOWNLOAD_DIR }}
+          merge-multiple: true
+
+      - name: 汇总生成最终md
+        run: |
+          cd ./usage/
+          python workflow_search.py
+
+      - name: 上传最终md
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 搜索结果md
+          path: ${{ env.JM_DOWNLOAD_DIR }}/*.md
+          if-no-files-found: warn
+          retention-days: 1
