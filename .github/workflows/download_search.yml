@@ -1,9 +1,11 @@
 name: 关键词搜索下载本子
 
 # 流程说明：
-# 1. 搜索 job：搜索关键词，预先给每个结果分配好压缩包名，产出分批计划（albums.json / batches.json）
-# 2. 下载 job（matrix，默认每个本子一个job）：只下载本批的本子，**每下完一个立即打包**成 <本子名>.zip，
-#    所以这个 job 一跑完，它产出的 zip 就立刻出现在页面的 Artifacts 区，不用等全部下完
+# 1. 搜索 job：搜索关键词，给每个本子预先分配好产物名（本子名，重名加 (n)），产出清单和下载计划
+# 2. 下载 job（matrix，**一个本子一个 job**）：下载这个本子，把图片按章节结构放到上传暂存目录，
+#    然后整个暂存目录作为产物上传，**产物名就是本子名**。
+#    GitHub 产物本身就是个 zip，所以下载下来就是 `<本子名>.zip`，里面直接是章节文件夹+图片，无嵌套压缩包。
+#    每个 job 一下完，它的产物立刻出现在页面的 Artifacts 区，不用等别的本子。
 # 3. 汇总 job：把所有本子的状态合并成最终 md（中途失败也会执行，能拿到已完成部分）
 
 on:
@@ -85,21 +87,15 @@ on:
         default: ''
         required: false
 
-      BATCH_SIZE:
-        type: number
-        description: '每个下载job处理几个本子。1 = 每个本子一个job，zip最快陆续出现在产物区；调大则job数和耗时更少'
-        default: 1
-        required: false
-
       MAX_PARALLEL:
         type: number
-        description: '同时运行的下载job数量上限（免费账号并发上限是20，别填太大）'
+        description: '同时运行的下载job数量上限（一个本子一个job，免费账号并发上限是20，别填太大）'
         default: 10
         required: false
 
       META_ONLY:
         type: choice
-        description: '是否只导出md（不下载图片、不打包zip、不起下载job）。选"是"时会翻页收录搜索结果（受 META_MAX 限制）'
+        description: '是否只导出md（不下载图片、不起下载job）。选"是"时会翻页收录搜索结果（受 META_MAX 限制）'
         default: '否'
         required: false
         options:
@@ -111,15 +107,6 @@ on:
         description: '只导出md模式下，最多收录的搜索结果数量（翻页搜索直到达到该数量或没有更多结果）。0 表示不限制'
         default: 100
         required: false
-
-      DELETE_AFTER_ZIP:
-        type: choice
-        description: '每个本子打包成zip后，是否删除原始图片文件夹（zip内保留章节结构，原始文件就不再保留）'
-        default: 是
-        required: false
-        options:
-          - 是
-          - 否
 
       CLIENT_IMPL:
         type: string
@@ -172,11 +159,9 @@ env:
   SEARCH_CATEGORY: ${{ github.event.inputs.SEARCH_CATEGORY }}
   SEARCH_SUB_CATEGORY: ${{ github.event.inputs.SEARCH_SUB_CATEGORY }}
 
-  # 分批与模式
-  BATCH_SIZE: ${{ github.event.inputs.BATCH_SIZE }}
+  # 模式
   META_ONLY: ${{ github.event.inputs.META_ONLY }}
   META_MAX: ${{ github.event.inputs.META_MAX }}
-  DELETE_AFTER_ZIP: ${{ github.event.inputs.DELETE_AFTER_ZIP }}
 
   # 下载相关输入
   CLIENT_IMPL: ${{ github.event.inputs.CLIENT_IMPL }}
@@ -200,6 +185,7 @@ env:
   # 固定值
   JM_DOWNLOAD_DIR: /home/runner/work/jmcomic/download/
   JM_META_DIR: /home/runner/work/jmcomic/meta/
+  JM_UPLOAD_DIR: /home/runner/work/jmcomic/upload/
 
 jobs:
   # ------------------------------------------------------------------
@@ -273,7 +259,7 @@ jobs:
           retention-days: 1
 
   # ------------------------------------------------------------------
-  # 2. 分批下载并打包：一个 job 一批（默认一批一个本子），跑完即出产物
+  # 2. 下载：一个本子一个 job，产物名 = 本子名，跑完即出产物
   # ------------------------------------------------------------------
   download:
     needs: search
@@ -321,18 +307,26 @@ jobs:
           name: 搜索元信息
           path: ${{ env.JM_META_DIR }}
 
-      - name: 下载本批本子并立即打包 ${{ matrix.batch.ids }}
+      - name: 下载本子 JM${{ matrix.batch.ids }}（${{ matrix.batch.title }}）
         run: |
           cd ./usage/
           python workflow_search.py
 
-      - name: 上传本批产物（zip + 状态）
+      - name: 上传产物 —— 产物名就是本子名，下载即 <本子名>.zip
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: 本子-${{ matrix.batch.ids }}
+          name: ${{ matrix.batch.name }}
+          path: ${{ env.JM_UPLOAD_DIR }}/*
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: 上传状态文件（给汇总job用，很小）
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 状态-${{ matrix.batch.ids }}
           path: |
-            ${{ env.JM_DOWNLOAD_DIR }}/*.zip
             ${{ env.JM_DOWNLOAD_DIR }}/status/*.json
             ${{ env.JM_DOWNLOAD_DIR }}/*.log
           if-no-files-found: warn
@@ -380,7 +374,8 @@ jobs:
       - name: 下载所有本子的状态文件
         uses: actions/download-artifact@v4
         with:
-          pattern: 本子-*
+          # 状态产物是 状态-<id>，很小；本子产物（图片）不下载，汇总只需要状态
+          pattern: 状态-*
           path: ${{ env.JM_DOWNLOAD_DIR }}
           merge-multiple: true
 
