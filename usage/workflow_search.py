@@ -1,20 +1,23 @@
 """
-GitHub Actions 关键词搜索脚本（支持拆成 搜索 / 下载 / 汇总 三种模式跑在不同 job 上）
+GitHub Actions 关键词搜索脚本（拆成 搜索 / 下载 / 汇总 三种模式，跑在不同 job 上）
 
 工作流分三个 job（见 .github/workflows/download_search.yml）：
 1. 搜索 job（SCRIPT_MODE=search）
-   执行搜索，给每个结果**预先分配好压缩包名**，写出：
-   - albums.json  搜索结果清单（含 zip 名）
-   - batches.json 分批计划（每批交给一个下载 job）
+   执行搜索，给每个结果**预先分配好打包名**（本子名，重名加 (1)、(2)...），写出：
+   - albums.json   搜索结果清单（含打包名）
+   - batches.json  每个本子一条（一个本子一个下载 job）
    - 初始 md（META_ONLY=是 时会补全详情，直接就是最终 md）
-2. 下载 job（SCRIPT_MODE=download，matrix 分批并行）
-   只下载本批的 id，**每下完一个本子立即打包**成 `<本子名>.zip`（重名加 (1)、(2)...，
-   zip 内保留章节文件夹结构），每个本子写一份 status/<aid>.json。
-   因为每批就是一个独立 job，所以这个 job 一结束，它的 zip 立刻出现在产物区。
+2. 下载 job（SCRIPT_MODE=download，matrix 并行，**一个本子一个 job**）
+   下载这个本子，把图片按章节结构搬到上传暂存目录，并写一份 <aid>.json 状态。
+   然后工作流把暂存目录作为产物上传，**产物名就是本子名**。
+   因为每个 job 只下一个本子，所以这个 job 一跑完，它的产物立刻出现在网页的 Artifacts 区。
+   ⚠ 下载模式下不再套内层 zip：GitHub 产物本身就是 zip，下载下来就是 `<本子名>.zip`，
+   里面直接是章节文件夹和图片，没有嵌套压缩包。
 3. 汇总 job（SCRIPT_MODE=merge）
-   把 albums.json + 所有 status/*.json 合并成一个记录所有作品信息的 md。
+   把所有 <aid>.json 合并成一个记录所有作品信息的 md。
 
-本地单机跑（不拆 job）时用 SCRIPT_MODE=full（默认），等价于「搜索 + 全部下载 + 出最终md」。
+本地单机跑（不拆 job）时用 SCRIPT_MODE=full（默认）：搜索 + 全部下载 + 出最终md。
+本地没有 GitHub 产物机制，所以 full 模式会自己把每个本子打成 `<本子名>.zip`。
 
 环境变量：
 - SCRIPT_MODE:        search / download / merge / full，默认 full
@@ -28,10 +31,10 @@ GitHub Actions 关键词搜索脚本（支持拆成 搜索 / 下载 / 汇总 三
 - SEARCH_SUB_CATEGORY: 副分类（可选，网页端支持）
 - META_ONLY:          是否只导出md（不下载图片/不打包），'否'/'是'，默认 '否'
 - META_MAX:           META_ONLY=是 时最多收录的搜索结果数量（会翻页搜索），0 表示不限制，默认 100
-- BATCH_SIZE:         每个下载job处理几个本子，默认 1（=每个本子一个job，产物最快陆续出现）
-- ALBUM_IDS:          download 模式要下载的本子id（多个用 - 或 , 分隔）
+- ALBUM_IDS:          download 模式要下载的本子id（多个用 - 或 , 分隔，实际只会传一个）
 - JM_META_DIR:        albums.json 所在目录，默认与 JM_DOWNLOAD_DIR 相同
-- DELETE_AFTER_ZIP:   打包成功后是否删除原始文件夹，'是'/'否'，默认 '是'
+- JM_UPLOAD_DIR:      download 模式的上传暂存目录，默认 <JM_DOWNLOAD_DIR>/upload
+- DELETE_AFTER_ZIP:   仅 full 模式用：打包成功后是否删除原始文件夹，'是'/'否'，默认 '是'
 
 以下变量与下载工作流共用，见 workflow_download.py：
 - CLIENT_IMPL / DIR_RULE / IMAGE_SUFFIX / IMAGE_QUALITY / PDF_OPTION / PDF_NAME_RULE
@@ -39,6 +42,7 @@ GitHub Actions 关键词搜索脚本（支持拆成 搜索 / 下载 / 汇总 三
 import json
 import os
 import re
+import shutil
 import threading
 
 from jmcomic import *
@@ -55,7 +59,6 @@ SEARCH_METHOD_MAP = {
 }
 
 ALBUMS_FILE = 'albums.json'
-BATCHES_FILE = 'batches.json'
 STATUS_DIR = 'status'
 
 
@@ -95,11 +98,6 @@ def write_json(filepath, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def chunked(items, size):
-    for index in range(0, len(items), size):
-        yield items[index:index + size]
-
-
 def md_escape(text) -> str:
     """转义 markdown 表格中的特殊字符"""
     return str(text).replace('|', '\\|').replace('\n', ' ').strip()
@@ -113,22 +111,26 @@ def truncate_name(name: str, max_bytes: int = 180) -> str:
     return raw[:max_bytes].decode('utf-8', errors='ignore')
 
 
-def decide_zip_base_name(title, aid) -> str:
-    """用本子名作为压缩包名，去掉非法字符并兜底"""
+def decide_package_base_name(title, aid) -> str:
+    """
+    用本子名作为打包名（不含后缀），去掉文件名里的非法字符并兜底。
+
+    这个名字会被用作 GitHub 产物的名字，所以必须是安全的文件名。
+    """
     name = fix_windir_name(title or '').strip(' .')
     if not name:
         name = f'JM{aid}'
     return truncate_name(name)
 
 
-def allocate_zip_name(base_name: str, used_names: set) -> str:
-    """分配压缩包文件名，重名时加 (1)、(2)..."""
-    name = f'{base_name}.zip'
+def allocate_package_name(base_name: str, used_names: set) -> str:
+    """分配打包名，重名时加 (1)、(2)..."""
+    name = base_name
     if name in used_names:
         index = 1
-        while f'{base_name}({index}).zip' in used_names:
+        while f'{base_name}({index})' in used_names:
             index += 1
-        name = f'{base_name}({index}).zip'
+        name = f'{base_name}({index})'
     used_names.add(name)
     return name
 
@@ -168,33 +170,33 @@ def album_to_dict(album) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 下载 + 每个本子下载完立即打包
+# 下载
 # ---------------------------------------------------------------------------
 
 class ZipSummary:
     """
-    记录每个本子的打包结果（本子之间是并发下载的，这里加锁）。
+    记录每个本子的下载/打包结果（本子之间并发下载时加锁）。
     """
 
     def __init__(self, preassigned_names=None):
         self.lock = threading.Lock()
-        self.records = {}  # album_id -> dict(album, image_count, zip_name, error)
+        self.records = {}  # album_id -> dict(album, image_count, package, error)
         self.preassigned_names = dict(preassigned_names or {})
-        self.used_zip_names = set()
+        self.used_names = set()
 
     def update(self, aid, **fields):
         with self.lock:
             record = self.records.setdefault(str(aid), {})
             record.update(fields)
 
-    def allocate_zip_name(self, aid, base_name: str) -> str:
-        """优先用搜索 job 预先分配好的名字，保证跨 job 命名一致"""
+    def allocate_package(self, aid, base_name: str) -> str:
+        """优先用搜索 job 预先分配好的打包名，保证跨 job 命名一致"""
         with self.lock:
             name = self.preassigned_names.get(str(aid))
             if name is not None:
                 return name
 
-            name = allocate_zip_name(base_name, self.used_zip_names)
+            name = allocate_package_name(base_name, self.used_names)
             self.preassigned_names[str(aid)] = name
             return name
 
@@ -202,18 +204,63 @@ class ZipSummary:
         with self.lock:
             return dict(self.records.get(str(aid)) or {})
 
-    def all_records(self):
-        with self.lock:
-            return {aid: dict(record) for aid, record in self.records.items()}
+
+def stage_album_for_upload(option, album, upload_dir) -> int:
+    """
+    把本子目录里的内容搬到上传暂存目录，让产物解压后直接是章节文件夹（不套一层本子目录）。
+
+    :return: 搬过去的条目数
+    """
+    album_root = option.dir_rule.decide_album_root_dir(album)
+    if not os.path.isdir(album_root):
+        return 0
+
+    mkdir_if_not_exists(upload_dir)
+    moved = 0
+
+    for name in sorted(os.listdir(album_root)):
+        src = os.path.join(album_root, name)
+        dst = os.path.join(upload_dir, name)
+
+        if os.path.exists(dst):
+            # 同名兜底（正常不会发生：一个 job 只下一个本子）
+            index = 1
+            while os.path.exists(f'{dst}({index})'):
+                index += 1
+            dst = f'{dst}({index})'
+
+        shutil.move(src, dst)
+        moved += 1
+
+    return moved
+
+
+def collect_album_results(batch_result, summary) -> None:
+    """从 BatchResult 里取出每个本子的详情和图片数，并落实产物名，写进 summary"""
+    for result in batch_result:
+        album = result.detail
+        downloader = result.downloader
+        aid = str(album.album_id)
+
+        image_count = sum(
+            len(image_list)
+            for image_list in downloader.download_success_dict.get(album, {}).values()
+        )
+        package = summary.allocate_package(aid, decide_package_base_name(album.name, aid))
+
+        summary.update(aid, album=album_to_dict(album), image_count=image_count, package=package)
 
 
 class AlbumZipPlugin(ZipPlugin):
     """
-    每个本子下载完成后立即打包为 `<本子名>.zip`（重名加 (n)）。
+    【仅本地 full 模式使用】每个本子下载完成后立即打包为 `<打包名>.zip`。
 
     复用 jmcomic 内置 ZipPlugin 的压缩逻辑：
-    - 挂在 after_album 上，所以是「下载完一个本子就打包一个」，不是最后统一打包
+    - 挂在 after_album 上，所以是「下载完一个本子就打包一个」
     - zip 内保留章节文件夹结构（图片相对本子根目录存放，与下载目录一致）
+
+    注意：GitHub Actions 的 download 模式不用这个插件——产物本身就是 zip，
+    再套一层内层 zip 就变成压缩包嵌套了。
     """
 
     plugin_key = 'workflow_album_zip'
@@ -233,19 +280,20 @@ class AlbumZipPlugin(ZipPlugin):
         ExceptionTool.require_true(summary is not None, '插件参数 summary 不能为空')
 
         aid = str(album.album_id)
-        album_info = album_to_dict(album)
         image_count = sum(
             len(image_list)
             for image_list in downloader.download_success_dict.get(album, {}).values()
         )
-        summary.update(aid, album=album_info, image_count=image_count)
+        summary.update(aid, album=album_to_dict(album), image_count=image_count)
 
         if image_count == 0:
             summary.update(aid, error='没有下载到任何图片，跳过打包')
             return
 
         self.summary = summary
-        self.zip_name = summary.allocate_zip_name(aid, decide_zip_base_name(album.name, aid))
+        self.package = summary.allocate_package(
+            aid, decide_package_base_name(album.name, aid),
+        )
 
         try:
             super().invoke(
@@ -264,7 +312,7 @@ class AlbumZipPlugin(ZipPlugin):
             summary.update(aid, error=f'打包失败: {e}')
             raise
 
-        zip_path = os.path.join(zip_dir, self.zip_name)
+        zip_path = os.path.join(zip_dir, f'{self.package}.zip')
         if not zip_has_entry(zip_path):
             # 兜底：zip 里没有任何条目说明原图在打包前就没了（例如被别的插件删掉），
             # 这种情况删掉空包并记录异常，避免留一个空zip误导人
@@ -275,18 +323,18 @@ class AlbumZipPlugin(ZipPlugin):
             summary.update(aid, error=msg)
             return
 
-        summary.update(aid, zip_name=self.zip_name)
+        summary.update(aid, package=self.package)
 
     def decide_filepath(self, album, photo, filename_rule, suffix, base_dir, dir_rule_dict):
         """用本子名（而不是 dir_rule 规则）来决定压缩包路径"""
         base_dir = base_dir or os.getcwd()
         mkdir_if_not_exists(base_dir)
-        return fix_filepath(os.path.join(base_dir, self.zip_name))
+        return fix_filepath(os.path.join(base_dir, f'{self.package}.zip'))
 
 
 def download_and_zip(album_ids, option, download_dir, summary, delete_after_zip=True):
     """
-    下载指定的本子，每个本子下载完成后立即打包。
+    【仅本地 full 模式】下载本子，每个本子下载完成后立即打包。
 
     :return: BatchResult（含 .failed）
     """
@@ -313,9 +361,9 @@ def download_and_zip(album_ids, option, download_dir, summary, delete_after_zip=
     return batch_result
 
 
-def write_status_files(status_dir, album_ids, summary, failed_map):
+def write_status_files(target_dir, album_ids, summary, failed_map):
     """每个本子写一份状态文件，供汇总 job 合并 md"""
-    mkdir_if_not_exists(status_dir)
+    mkdir_if_not_exists(target_dir)
 
     for aid in album_ids:
         aid = str(aid)
@@ -324,12 +372,12 @@ def write_status_files(status_dir, album_ids, summary, failed_map):
         error = record.get('error')
         if error is None and aid in failed_map:
             error = f'下载失败: {failed_map[aid]}'
-        if error is None and record.get('zip_name') is None:
-            error = '未完成下载或打包'
+        if error is None and record.get('package') is None:
+            error = '未完成下载'
 
-        write_json(os.path.join(status_dir, f'{aid}.json'), {
+        write_json(os.path.join(target_dir, f'{aid}.json'), {
             'aid': aid,
-            'zip_name': record.get('zip_name'),
+            'package': record.get('package'),
             'image_count': record.get('image_count'),
             'error': error,
             'album': record.get('album'),
@@ -351,7 +399,7 @@ def fetch_album_info(client, aid):
 
 def build_records(albums, status_map=None, details=None, expect_download=False):
     """
-    albums:    [{'aid','title','tags','zip_name'}]
+    albums:    [{'aid','title','tags','package'}]
     status_map: aid -> status dict（下载job写的）
     details:   aid -> 本子详情 dict（只导出md模式下请求到的）
     """
@@ -374,8 +422,8 @@ def build_records(albums, status_map=None, details=None, expect_download=False):
             'aid': aid,
             'title': item.get('title') or f'JM{aid}',
             'tags': item.get('tags') or [],
-            'zip_name': status.get('zip_name'),
-            'plan_zip_name': item.get('zip_name'),
+            'package': status.get('package'),
+            'plan_package': item.get('package'),
             'image_count': status.get('image_count'),
             'error': error,
             'album': album,
@@ -389,7 +437,7 @@ def write_search_md(keyword, search_type, order_by, time_, category, records, fi
     lines = []
     add = lines.append
 
-    zip_records = [r for r in records if r.get('zip_name')]
+    packed_records = [r for r in records if r.get('package')]
     error_records = [r for r in records if r.get('error')]
 
     add(f'# 搜索结果: {keyword}')
@@ -406,7 +454,7 @@ def write_search_md(keyword, search_type, order_by, time_, category, records, fi
     add(f'| 时间范围 | {md_escape(time_)} |')
     add(f'| 类别 | {md_escape(category)} |')
     add(f'| 结果数量 | {len(records)} |')
-    add(f'| 打包数量 | {len(zip_records)} |')
+    add(f'| 打包数量 | {len(packed_records)} |')
     add(f'| 异常数量 | {len(error_records)} |')
     add(f'| 生成时间 | {time_stamp()} |')
     add('')
@@ -426,10 +474,10 @@ def write_search_md(keyword, search_type, order_by, time_, category, records, fi
         add(f'- ID: {aid}')
         add(f'- 链接: https://18comic.vip/album/{aid}/')
         add(f'- 搜索标签: {md_escape(", ".join(record.get("tags") or []))}')
-        if record.get('zip_name'):
-            add(f'- 打包文件: {record["zip_name"]}')
-        elif record.get('plan_zip_name'):
-            add(f'- 预定打包名: {record["plan_zip_name"]}（未生成）')
+        if record.get('package'):
+            add(f'- 打包产物: {record["package"]}.zip')
+        elif record.get('plan_package'):
+            add(f'- 预定打包名: {record["plan_package"]}.zip（未生成）')
         if record.get('image_count') is not None:
             add(f'- 图片数量: {record["image_count"]}')
         add('')
@@ -471,7 +519,7 @@ def write_search_md(keyword, search_type, order_by, time_, category, records, fi
 
     add('---')
     add('')
-    add(f'共 {len(records)} 个结果，成功打包 {len(zip_records)} 个，异常 {len(error_records)} 个。')
+    add(f'共 {len(records)} 个结果，成功打包 {len(packed_records)} 个，异常 {len(error_records)} 个。')
 
     mkdir_if_not_exists(os.path.dirname(filepath))
     write_text(filepath, '\n'.join(lines))
@@ -539,7 +587,6 @@ class SearchContext:
 
         self.meta_only = env_choice('META_ONLY', '否') == '是'
         self.meta_max = env_int('META_MAX', 100)
-        self.batch_size = max(1, env_int('BATCH_SIZE', 1))
         self.delete_after_zip = env_choice('DELETE_AFTER_ZIP', '是') == '是'
         self.album_ids = env_ids('ALBUM_IDS')
 
@@ -553,13 +600,14 @@ class SearchContext:
 
         self.download_dir = env('JM_DOWNLOAD_DIR', workspace())
         self.meta_dir = env('JM_META_DIR', None) or self.download_dir
+        self.upload_dir = env('JM_UPLOAD_DIR', None) or os.path.join(self.download_dir, 'upload')
         self.status_dir = os.path.join(self.download_dir, STATUS_DIR)
         self.md_path = os.path.join(self.download_dir, f'搜索结果-{fix_windir_name(self.keyword or "无关键词")}.md')
-        self.mode_label = '只导出md（不下载图片）' if self.meta_only else '下载并按本子打包zip'
+        self.mode_label = '只导出md（不下载图片）' if self.meta_only else '下载并按本子打包'
 
 
 def cmd_search(ctx: SearchContext):
-    """搜索 + 预先分配 zip 名 + 写 albums.json / batches.json / 初始md"""
+    """搜索 + 预先分配打包名 + 写 albums.json / batches.json / 初始md"""
     ExceptionTool.require_true(ctx.keyword, '未配置搜索关键词，请填入 SEARCH_KEYWORD')
 
     option = get_option()
@@ -577,10 +625,10 @@ def cmd_search(ctx: SearchContext):
     if len(result_list) == 0:
         jm_log('search', '没有搜索到任何结果，本次运行结束。')
         write_json(os.path.join(ctx.meta_dir, ALBUMS_FILE), _meta_dict(ctx, []))
-        write_json(os.path.join(ctx.meta_dir, BATCHES_FILE), [{'index': 1, 'ids': ''}])
+        write_json(os.path.join(ctx.meta_dir, 'batches.json'), [])
         return
 
-    # 预先分配压缩包名（单线程，保证跨 job 命名一致、重名加(n)）
+    # 预先分配打包名（单线程，保证跨 job 命名一致、重名加(n)）
     used_names = set()
     albums = []
     for aid, atitle, tags in result_list:
@@ -588,18 +636,19 @@ def cmd_search(ctx: SearchContext):
             'aid': str(aid),
             'title': atitle,
             'tags': list(tags),
-            'zip_name': allocate_zip_name(decide_zip_base_name(atitle, aid), used_names),
+            'package': allocate_package_name(decide_package_base_name(atitle, aid), used_names),
         })
 
     write_json(os.path.join(ctx.meta_dir, ALBUMS_FILE), _meta_dict(ctx, albums))
 
-    # 分批计划：每批交给一个下载 job
+    # 一个本子一个下载 job（产物名必须是本子名，所以不能一批多个）
     batches = [
-        {'index': index + 1, 'ids': '-'.join(item['aid'] for item in chunk)}
-        for index, chunk in enumerate(chunked(albums, ctx.batch_size))
+        {'index': index + 1, 'ids': item['aid'], 'name': item['package'], 'title': item['title']}
+        for index, item in enumerate(albums)
     ]
-    write_json(os.path.join(ctx.meta_dir, BATCHES_FILE), batches)
-    jm_log('search', f'分批计划: {len(batches)} 批（每批 {ctx.batch_size} 个）')
+    write_json(os.path.join(ctx.meta_dir, 'batches.json'), batches)
+    jm_log('search',
+           f'共 {len(albums)} 个本子，将启动 {len(batches)} 个下载job（一个本子一个job，产物名=本子名）')
 
     # 初始 md：只导出md模式下会补全详情，直接就是最终结果
     details = {}
@@ -622,7 +671,6 @@ def _meta_dict(ctx: SearchContext, albums: list) -> dict:
         'order_by': ctx.order_by,
         'time': ctx.time_,
         'category': ctx.category,
-        'batch_size': ctx.batch_size,
         'mode_label': ctx.mode_label,
         'albums': albums,
     }
@@ -635,7 +683,12 @@ def load_meta(ctx: SearchContext) -> dict:
 
 
 def cmd_download(ctx: SearchContext):
-    """下载本批本子，每下完一个立即打包，并写状态文件"""
+    """
+    下载这个本子 → 图片搬到上传暂存目录（产物解压后直接是章节文件夹）
+
+    不套内层 zip：GitHub 产物本身就是一个 zip，产物名 = 本子名，
+    所以用户下载到的就是 `<本子名>.zip`，里面直接是图片，无嵌套压缩包。
+    """
     meta = load_meta(ctx)
     album_map = {str(item['aid']): item for item in meta.get('albums') or []}
 
@@ -649,36 +702,85 @@ def cmd_download(ctx: SearchContext):
         f'本批id不在搜索元信息中: {[aid for aid in album_ids if aid not in album_map]}'
     )
 
-    summary = ZipSummary({aid: album_map[aid]['zip_name'] for aid in album_ids})
+    summary = ZipSummary({aid: album_map[aid]['package'] for aid in album_ids})
     option = get_option()
 
-    batch_result = download_and_zip(album_ids, option, ctx.download_dir, summary, ctx.delete_after_zip)
+    jm_log('search', f'开始下载 {len(album_ids)} 个本子: {album_ids}')
+    batch_result = download_album(album_ids, option)
 
     failed_map = dict(getattr(batch_result, 'failed', None) or {})
-    if failed_map:
-        jm_log('search', f'下载失败 {len(failed_map)} 个: {list(failed_map)}')
+    collect_album_results(batch_result, summary)
 
+    # 把图片搬到上传暂存目录：产物解压后直接是章节文件夹，不套一层本子目录
+    for aid in album_ids:
+        record = summary.get(aid)
+        album_info = record.get('album')
+        if album_info is None:
+            continue
+
+        album = _album_from_dict(album_info)
+        moved = stage_album_for_upload(option, album, ctx.upload_dir)
+        jm_log('search', f'JM{aid} 已暂存 {moved} 个条目到上传目录: {ctx.upload_dir}')
+
+    # 状态文件单独放，作为独立的小产物上传（避免汇总job去下载一大堆图片）
     write_status_files(ctx.status_dir, album_ids, summary, failed_map)
 
     for aid in album_ids:
         record = summary.get(aid)
-        jm_log('search', f'JM{aid} 完成: zip={record.get("zip_name")}, '
+        jm_log('search', f'JM{aid} 完成: 产物名=[{record.get("package")}], '
                          f'图片={record.get("image_count")}, 异常={record.get("error")}')
 
 
+def _album_from_dict(data: dict):
+    """
+    用 dict 还原一个本子实体（只为拿到 dir_rule 需要的字段：
+    album_id / authors / name / episode_list）。
+    """
+    return JmModuleConfig.album_class()(
+        album_id=data.get('aid'),
+        scramble_id='0',
+        name=data.get('name') or '',
+        episode_list=[tuple(episode) for episode in (data.get('episodes') or [])],
+        page_count=data.get('page_count') or 0,
+        pub_date=data.get('pub_date') or '',
+        update_date=data.get('update_date') or '',
+        likes=data.get('likes') or '',
+        views=data.get('views') or '',
+        comment_count=data.get('comment_count') or 0,
+        works=list(data.get('works') or []),
+        actors=list(data.get('actors') or []),
+        authors=list(data.get('authors') or []),
+        tags=list(data.get('tags') or []),
+        description=data.get('description') or '',
+    )
+
+
+def _load_status_map(root_dir) -> dict:
+    """递归扫描状态文件（下载job会把 <aid>.json 放进各自产物的根目录）"""
+    status_map = {}
+    if not os.path.isdir(root_dir):
+        return status_map
+
+    for dirpath, _dirnames, filenames in os.walk(root_dir):
+        for name in filenames:
+            if not name.endswith('.json'):
+                continue
+
+            data = read_json(os.path.join(dirpath, name), None)
+            if isinstance(data, dict) and data.get('aid') and 'album' in data:
+                status_map[str(data['aid'])] = data
+
+    return status_map
+
+
 def cmd_merge(ctx: SearchContext):
-    """合并 albums.json + 所有 status/*.json，写出最终 md"""
+    """合并 albums.json + 所有状态文件，写出最终 md"""
     meta = load_meta(ctx)
     albums = meta.get('albums') or []
 
-    status_map = {}
+    status_map = _load_status_map(ctx.download_dir)
     if os.path.isdir(ctx.status_dir):
-        for name in sorted(os.listdir(ctx.status_dir)):
-            if not name.endswith('.json'):
-                continue
-            data = read_json(os.path.join(ctx.status_dir, name), None)
-            if data and data.get('aid'):
-                status_map[str(data['aid'])] = data
+        status_map.update(_load_status_map(ctx.status_dir))
 
     records = build_records(albums, status_map=status_map, expect_download=True)
     write_search_md(
@@ -690,12 +792,12 @@ def cmd_merge(ctx: SearchContext):
         records, ctx.md_path, meta.get('mode_label') or ctx.mode_label,
     )
 
-    zip_count = len([r for r in records if r.get('zip_name')])
-    jm_log('search', f'汇总完成: 共 {len(records)} 个结果, 打包 {zip_count} 个, md: {ctx.md_path}')
+    packed = len([r for r in records if r.get('package')])
+    jm_log('search', f'汇总完成: 共 {len(records)} 个结果, 打包 {packed} 个, md: {ctx.md_path}')
 
 
 def cmd_full(ctx: SearchContext):
-    """本地单机：搜索 + 全部下载 + 出最终md（等价于拆 job 的完整流程）"""
+    """本地单机：搜索 + 全部下载 + 每个本子打成zip + 出最终md（没有GitHub产物机制，所以自己打包）"""
     cmd_search(ctx)
 
     meta = load_meta(ctx)
@@ -704,7 +806,7 @@ def cmd_full(ctx: SearchContext):
         return
 
     album_ids = [str(item['aid']) for item in albums]
-    summary = ZipSummary({item['aid']: item['zip_name'] for item in albums})
+    summary = ZipSummary({item['aid']: item['package'] for item in albums})
     option = get_option()
 
     batch_result = download_and_zip(album_ids, option, ctx.download_dir, summary, ctx.delete_after_zip)
@@ -731,7 +833,7 @@ def main():
     )
 
     jm_log('search', f'SCRIPT_MODE={ctx.mode}, 关键词=[{ctx.keyword}], '
-                     f'下载目录=[{ctx.download_dir}], 元信息目录=[{ctx.meta_dir}]')
+                     f'下载目录=[{ctx.download_dir}], 上传目录=[{ctx.upload_dir}]')
     handler(ctx)
 
 
